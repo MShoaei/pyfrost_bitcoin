@@ -1,3 +1,6 @@
+from typing import Optional
+import hashlib
+
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
@@ -7,7 +10,6 @@ from fastecdsa.encoding.sec1 import SEC1Encoder
 from fastecdsa import keys, curve
 from fastecdsa.curve import Curve
 from fastecdsa.point import Point
-from typing import List, Dict
 from web3 import Web3
 
 import math
@@ -48,7 +50,7 @@ class Polynomial:
         """
         self.threshold: int = threshold
         self.curve: Curve = curve
-        self.coefficients: List[int] = []
+        self.coefficients: list[int] = []
 
         # If an initial coefficient is provided, convert it to an integer from a hex string if necessary
         # and add it as the first coefficient of the polynomial.
@@ -85,7 +87,7 @@ class Polynomial:
         # Return the result as an elliptic curve private key.
         return result
 
-    def coef_pub_keys(self) -> List[Point]:
+    def coef_pub_keys(self) -> list[Point]:
         """
         Retrieves the public keys corresponding to the private coefficient keys.
 
@@ -103,6 +105,55 @@ class Polynomial:
 ecurve: Curve = curve.secp256k1
 N: int = ecurve.q
 Half_N: int = ((N >> 1) % N + 1) % N
+
+
+def tagged_hash(tag: str, msg: bytes) -> bytes:
+    tag_hash = hashlib.sha256(tag.encode()).digest()
+    return hashlib.sha256(tag_hash + tag_hash + msg).digest()
+
+
+def int_from_bytes(b: bytes) -> int:
+    return int.from_bytes(b, byteorder="big")
+
+
+def bytes_from_int(x: int) -> bytes:
+    return x.to_bytes(32, byteorder="big")
+
+
+def has_even_y(P: Point) -> bool:
+    return P.y % 2 == 0
+
+
+def lift_x(x: int) -> Optional[Point]:
+    if x >= ecurve.p:
+        return None
+    y_sq = (pow(x, 3, ecurve.p) + 7) % ecurve.p
+    y = pow(y_sq, (ecurve.p + 1) // 4, ecurve.p)
+    if pow(y, 2, ecurve.p) != y_sq:
+        return None
+    return Point(x, y if y & 1 == 0 else ecurve.p - y, curve=ecurve)
+
+
+def calculate_tweak(pubkey_x: bytes, scripts):
+    assert scripts is None, "scripts is not supported yet"
+    if not scripts:
+        tweak = tagged_hash("TapTweak", pubkey_x)
+    else:
+        raise NotImplementedError()
+    tweak_int = int_from_bytes(tweak)
+
+    return tweak_int
+
+
+def taproot_tweak_pubkey(pubkey, h)->tuple[bool, int]:
+    t = int_from_bytes(tagged_hash("TapTweak", pubkey + h))
+    if t >= ecurve.q:
+        raise ValueError
+    P = lift_x(int_from_bytes(pubkey))
+    if P is None:
+        raise ValueError
+    Q = P + ecurve.G*t
+    return has_even_y(Q), bytes_from_int(Q.x)
 
 
 def mod_inverse(number: int, modulus: int) -> int:
@@ -150,14 +201,14 @@ def private_to_point(private_key: int) -> Point:
     return keys.get_public_key(private_key, ecurve)
 
 
-def pub_compress(public_key: Point) -> Dict:
+def pub_compress(public_key: Point) -> dict:
     coded = SEC1Encoder.encode_public_key(public_key, True)
     x = '0x' + coded.hex()[2:]
     y = int(coded.hex()[1]) - 2
     return {'x': x, 'y_parity': y}
 
 
-def pub_decompress(pub_dict: Dict) -> Point:
+def pub_decompress(pub_dict: dict) -> Point:
     x = pub_dict['x']
     y = pub_dict['y_parity'] + 2
     coded = '0' + str(y) + x[2:]
@@ -166,7 +217,7 @@ def pub_decompress(pub_dict: Dict) -> Point:
     return publicKey
 
 
-def calc_poly_point(polynomial: List[Point], x: int) -> Point:
+def calc_poly_point(polynomial: list[Point], x: int) -> Point:
     x = int(x)
     coefs = []
     for i in range(len(polynomial)):
@@ -181,7 +232,7 @@ def generate_random_private() -> int:
     return keys.gen_private_key(ecurve)
 
 
-def langrange_coef(index: int, threshold: int, shares: List[Dict], x: int) -> int:
+def lagrange_coef(index: int, threshold: int, shares: list[dict], x: int) -> int:
     x_j = int(shares[index]['id'])
     nums = []
     denums = []
@@ -194,11 +245,12 @@ def langrange_coef(index: int, threshold: int, shares: List[Dict], x: int) -> in
     return mod_inverse(denum, N) * num
 
 
-def reconstruct_share(shares: List[Dict], threshold: int, x: int) -> int:
+def reconstruct_share(shares: list[dict], threshold: int, x: int) -> int:
     assert len(shares) == threshold, 'Number of shares must be t.'
     sum = 0
     for j in range(threshold):
-        coef = langrange_coef(j, threshold, shares, x)
+        coef = lagrange_coef(j, threshold, shares, x)  % ecurve.q
+        print(j, threshold, shares, x, coef)
         key = shares[j]['key']
         sum = (sum + (key * coef % N)) % N
     return sum % N
@@ -212,19 +264,19 @@ def schnorr_hash(public_key: Point, message: int) -> str:
     return Web3.keccak(int(totalBuff, 16))
 
 
-def schnorr_sign(shared_private_key: int, nounce_private: int, nounce_public: Point, message: int) -> Dict[str, int]:
+def schnorr_sign(shared_private_key: int, nounce_private: int, nounce_public: Point, message: int) -> dict[str, int]:
     e = int.from_bytes(schnorr_hash(nounce_public, message), 'big')
     s = (nounce_private - e * shared_private_key) % N
     return {'s': s, 'e': e}
 
 
-def stringify_signature(signature: Dict[str, int]) -> str:
+def stringify_signature(signature: dict[str, int]) -> str:
     S = f'{hex(signature["s"])[2:]:0>64}'
     E = f'{hex(signature["e"])[2:]:0>64}'
     return '0x' + E + S
 
 
-def split_signature(string_signature: str) -> Dict[str, int]:
+def split_signature(string_signature: str) -> dict[str, int]:
     raw_bytes = string_signature[2:]
     assert len(raw_bytes) == 128, 'Invalid schnorr signature string'
     e = '0x' + raw_bytes[0:64]
@@ -243,12 +295,12 @@ def schnorr_verify(public_key: Point, message: str, signature: str) -> bool:
     return int.from_bytes(e_v, 'big') == signature['e']
 
 
-def schnorr_aggregate_signatures(threshold: int, signatures: List[Dict[str, int]], party: List[str]) -> Dict[str, int]:
+def schnorr_aggregate_signatures(threshold: int, signatures: list[dict[str, int]], party: list[str]) -> dict[str, int]:
     assert len(signatures) >= threshold, 'At least t signatures are needed'
     aggregated_signature = 0
 
     for j in range(threshold):
-        coef = langrange_coef(
+        coef = lagrange_coef(
             j, threshold, [{'id': i} for i in party], 0)
         aggregated_signature += signatures[j]['s'] * coef
     s = aggregated_signature % N

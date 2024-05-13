@@ -233,8 +233,11 @@ class Key:
         self.dkg_key_pair['dkg_public_key'] = code_to_pub(self.dkg_key_pair['dkg_public_key'])
         self.node_id = node_id
 
-    def sign(self, commitments_dict: Dict, message: str, nonces: List[Dict]) -> Tuple[Dict, Dict]:
-        assert isinstance(message, str), 'Message should be of string type.'
+    def sign(
+        self, commitments_dict: Dict, message_hash: bytes, nonces: list[dict]
+    ) -> tuple[dict, dict]:
+        assert isinstance(message_hash, bytes), "Message should be of bytes type."
+
 
         nonce_d, nonce_e = 0, 0
         signature, used_nonce = None, None
@@ -247,12 +250,12 @@ class Key:
             if nonce_d is not None and nonce_e is not None:
                 signature = single_sign(
                     int(self.node_id),
-                    self.dkg_key_pair['share'],
+                    self.dkg_key_pair["share"],
                     nonce_d,
                     nonce_e,
-                    message,
+                    message_hash,
                     commitments_dict,
-                    pub_to_code(self.dkg_key_pair['dkg_public_key'])
+                    self.dkg_key_pair["dkg_public_key"],
                 )
                 used_nonce = {
                     'nonce_d_pair': {my_nonce['public_nonce_d']: nonce_d},
@@ -317,7 +320,7 @@ def verify_single_signature(id: int, message: str, commitments_dict: Dict[str, D
     )
 
     # Calculate coefficients and points
-    coef = langrange_coef(index, len(commitments_list), commitments_list, 0)
+    coef = lagrange_coef(index, len(commitments_list), commitments_list, 0)
     point1 = public_nonce - \
         (int.from_bytes(challenge, 'big') * coef * code_to_pub(public_key_share))
     point2 = single_signature['signature'] * ecurve.G
@@ -359,19 +362,21 @@ def aggregate_nonce(message: str, commitments_dict: Dict[str, Dict[str, int]], g
     return aggregated_public_nonce
 
 
-def aggregate_signatures(message: str, single_signatures: List[Dict[str, int]], aggregated_public_nonce: Point, group_key: int) -> Dict:
-    # Calculate message hash
-    message_hash = Web3.keccak(text=message)
-
+def aggregate_signatures(
+    message_hash: bytes,
+    single_signatures: list[dict[str, int]],
+    aggregated_public_nonce: Point,
+    group_key: int,
+) -> dict:
     # Aggregate signatures
     aggregated_signature = sum(sign['signature']
                                for sign in single_signatures) % N
 
     return {
-        'nonce': pub_to_addr(aggregated_public_nonce),
-        'public_key': pub_compress(code_to_pub(group_key)),
-        'signature': aggregated_signature,
-        'message_hash': message_hash
+        "public_nonce": aggregated_public_nonce,
+        "public_key": code_to_pub(group_key),
+        "signature": aggregated_signature,
+        "message_hash": message_hash,
     }
 
 
@@ -402,12 +407,18 @@ def verify_group_signature(aggregated_signature: Dict) -> bool:
 # =======================================================================================
 
 
-def single_sign(id: str, share: int, nonce_d: int, nonce_e: int, message: str,
-                commitments_dict: Dict[str, Dict[str, int]], group_key: Point) -> Dict[str, int]:
+def single_sign(
+    id: str,
+    share: int,
+    nonce_d: int,
+    nonce_e: int,
+    message_hash: bytes,
+    commitments_dict: dict[str, dict[str, int]],
+    group_key: Point,
+) -> dict[str, int]:
     # Prepare hashes and list
     commitments_list = list(commitments_dict.values())
     commitments_hash = Web3.keccak(text=json.dumps(commitments_list))
-    message_hash = Web3.keccak(text=message)
 
     # Aggregate public nonces and find the relevant row and index
     aggregated_public_nonce = None
@@ -431,24 +442,38 @@ def single_sign(id: str, share: int, nonce_d: int, nonce_e: int, message: str,
         if id == commitment['id']:
             my_row, index = row, idx
 
-    # Calculate challenge
-    group_key_pub = pub_compress(code_to_pub(group_key))
-    challenge = Web3.solidity_keccak(
-        ['uint256', 'uint8', 'uint256', 'address'],
-        [Web3.to_int(hexstr=group_key_pub['x']), group_key_pub['y_parity'],
-         Web3.to_int(message_hash), pub_to_addr(aggregated_public_nonce)]
+    tweak_int = calculate_tweak(bytes_from_int(group_key.x), None)
+    tweaked_share = share + tweak_int
+    tweaked_pubkey_has_even_y, tweaked_pubkey = taproot_tweak_pubkey(bytes_from_int(group_key.x), b"")
+    
+    P = tweaked_pubkey
+    if not tweaked_pubkey_has_even_y:
+        tweaked_share = ecurve.q - tweaked_share
+
+    k0 = (nonce_d + nonce_e * int.from_bytes(my_row, "big")) % ecurve.q
+    
+    R = aggregated_public_nonce
+    k = ecurve.q - k0 if aggregated_public_nonce.y % 2 == 1 else k0
+
+    challenge = (
+        int_from_bytes(
+            tagged_hash(
+                "BIP0340/challenge",
+                bytes_from_int(R.x) + P + message_hash,
+            )
+        )
+        % ecurve.q
     )
 
     # Calculate signature share
-    coef = langrange_coef(index, len(commitments_list), commitments_list, 0)
-    signature_share = (nonce_d + nonce_e * int.from_bytes(my_row, 'big') -
-                       coef * share * int.from_bytes(challenge, 'big')) % N
+    coef = lagrange_coef(index, len(commitments_list), commitments_list, 0) % ecurve.q
+    signature_share = (k + coef * tweaked_share * challenge) % ecurve.q
 
     return {
         'id': id,
         'signature': signature_share,
         'public_key': pub_to_code(keys.get_public_key(share, ecurve)),
-        'aggregated_public_nonce': pub_to_code(aggregated_public_nonce)
+        'aggregated_public_nonce': aggregated_public_nonce
     }
 
 
