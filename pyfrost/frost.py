@@ -1,6 +1,29 @@
 from fastecdsa import keys
 from web3 import Web3
-from .crypto_utils import *
+from .crypto_utils import (
+    bytes_from_int,
+    calc_poly_point,
+    calculate_tweak,
+    complaint_sign,
+    code_to_pub,
+    decrypt,
+    ecurve,
+    encrypt,
+    generate_hkdf_key,
+    generate_random_private,
+    has_even_y,
+    int_from_bytes,
+    lagrange_coef,
+    lift_x,
+    N,
+    Polynomial,
+    pub_to_code,
+    schnorr_sign,
+    schnorr_verify,
+    stringify_signature,
+    tagged_hash,
+    taproot_tweak_pubkey,
+)
 from typing import List, Dict, Tuple
 import json
 from fastecdsa.point import Point
@@ -291,39 +314,45 @@ def create_nonces(node_id: int, number_of_nonces: int = 10) -> Tuple[List[Dict],
     return nonce_publics, nonce_privates
 
 
-def verify_single_signature(id: int, message: str, commitments_dict: Dict[str, Dict[str, int]], aggregated_public_nonce: Point,
-                            public_key_share: int, single_signature: Dict[str, int], group_key: Point) -> bool:
+def verify_single_signature(id: int, message_hash: bytes, commitments_dict: Dict[str, Dict[str, int]], aggregated_public_nonce: Point,
+                            public_key_share: Point, single_signature: int, group_key: Point) -> bool:
     # Prepare hashes and list
     commitments_list = list(commitments_dict.values())
     commitments_hash = Web3.keccak(text=json.dumps(commitments_list))
-    message_hash = Web3.keccak(text=message)
 
     # Find the relevant commitment and calculate the public nonce
-    public_nonce, index = None, 0
+    public_nonce0, index = None, 0
     for idx, commitment in enumerate(commitments_list):
         if commitment['id'] == id:
             nonce_d_public = code_to_pub(commitment['public_nonce_d'])
             nonce_e_public = code_to_pub(commitment['public_nonce_e'])
             row = Web3.solidity_keccak(['string', 'bytes', 'bytes'],
                                        [hex(commitment['id']), message_hash, commitments_hash])
-            public_nonce = nonce_d_public + \
+            public_nonce0 = nonce_d_public + \
                 (int.from_bytes(row, 'big') * nonce_e_public)
             index = idx
             break
 
-    # Calculate challenge
-    group_key_pub = pub_compress(code_to_pub(group_key))
-    challenge = Web3.solidity_keccak(
-        ['uint256', 'uint8', 'uint256', 'address'],
-        [Web3.to_int(hexstr=group_key_pub['x']), group_key_pub['y_parity'],
-         Web3.to_int(message_hash), pub_to_addr(aggregated_public_nonce)]
+    P = bytes_from_int(group_key.x)
+    R = aggregated_public_nonce
+    challenge = (
+        int_from_bytes(
+            tagged_hash(
+                "BIP0340/challenge",
+                bytes_from_int(R.x) + P + message_hash,
+            )
+        )
+        % ecurve.q
     )
 
+    # public_nonce = ecurve.q - public_nonce0 if R.y % 2 == 1 else public_nonce0
+    public_nonce = public_nonce0
+
     # Calculate coefficients and points
-    coef = lagrange_coef(index, len(commitments_list), commitments_list, 0)
-    point1 = public_nonce - \
-        (int.from_bytes(challenge, 'big') * coef * code_to_pub(public_key_share))
-    point2 = single_signature['signature'] * ecurve.G
+    coef = lagrange_coef(index, len(commitments_list), commitments_list, 0) % ecurve.q
+    point1 = public_nonce + \
+        (challenge * coef * public_key_share)
+    point2 = single_signature * ecurve.G
 
     # Verify the points
     return point1 == point2
@@ -379,26 +408,31 @@ def aggregate_signatures(
         "message_hash": message_hash,
     }
 
+def _schnorr_verify(msg: bytes, pubkey: bytes, sig: bytes) -> bool:
+    if len(msg) != 32:
+        raise ValueError("The message must be a 32-byte array.")
+    if len(pubkey) != 32:
+        raise ValueError("The public key must be a 32-byte array.")
+    if len(sig) != 64:
+        raise ValueError("The signature must be a 64-byte array.")
+    P = lift_x(int_from_bytes(pubkey))
+    r = int_from_bytes(sig[0:32])
+    s = int_from_bytes(sig[32:64])
+    if (P is None) or (r >= ecurve.p) or (s >= ecurve.q):
+        return False
+    e = int_from_bytes(tagged_hash("BIP0340/challenge", sig[0:32] + pubkey + msg)) % ecurve.q
+    R = ecurve.G* s + P*(ecurve.q - e)
+    if (R is None) or (not has_even_y(R)) or (R.x != r):
+        return False
+    return True
+
 
 def verify_group_signature(aggregated_signature: Dict) -> bool:
-    # Calculate the challenge
-    challenge = Web3.solidity_keccak(
-        ['uint256', 'uint8', 'uint256', 'address'],
-        [
-            Web3.to_int(hexstr=aggregated_signature['public_key']['x']),
-            aggregated_signature['public_key']['y_parity'],
-            Web3.to_int(aggregated_signature['message_hash']),
-            aggregated_signature['nonce']
-        ]
-    )
-
-    # Calculate the point
-    challenge_int = int.from_bytes(challenge, 'big')
-    point = (aggregated_signature['signature'] * ecurve.G) + \
-        (challenge_int * pub_decompress(aggregated_signature['public_key']))
-
-    # Verify the nonce
-    return aggregated_signature['nonce'] == pub_to_addr(point)
+    tweaked_pubkey = taproot_tweak_pubkey(bytes_from_int(aggregated_signature["public_key"].x), b"")
+    return _schnorr_verify(
+        aggregated_signature["message_hash"], 
+        bytes_from_int(tweaked_pubkey.x), 
+        bytes_from_int(aggregated_signature["public_nonce"].x)+bytes_from_int(aggregated_signature["signature"]))
 
 # TODO : exclude complaint
 
@@ -444,14 +478,14 @@ def single_sign(
 
     tweak_int = calculate_tweak(bytes_from_int(group_key.x), None)
     tweaked_share = share + tweak_int
-    tweaked_pubkey_has_even_y, tweaked_pubkey = taproot_tweak_pubkey(bytes_from_int(group_key.x), b"")
+    tweaked_pubkey = taproot_tweak_pubkey(bytes_from_int(group_key.x), b"")
     
-    P = tweaked_pubkey
-    if not tweaked_pubkey_has_even_y:
+    P = bytes_from_int(tweaked_pubkey.x)
+    if not has_even_y(tweaked_pubkey):
         tweaked_share = ecurve.q - tweaked_share
 
     k0 = (nonce_d + nonce_e * int.from_bytes(my_row, "big")) % ecurve.q
-    
+
     R = aggregated_public_nonce
     k = ecurve.q - k0 if aggregated_public_nonce.y % 2 == 1 else k0
 
@@ -470,10 +504,11 @@ def single_sign(
     signature_share = (k + coef * tweaked_share * challenge) % ecurve.q
 
     return {
-        'id': id,
-        'signature': signature_share,
-        'public_key': pub_to_code(keys.get_public_key(share, ecurve)),
-        'aggregated_public_nonce': aggregated_public_nonce
+        "id":id,
+        "aggregated_public_nonce":aggregated_public_nonce,
+        "tweaked_share_public_key":tweaked_share*ecurve.G,
+        "signature":signature_share,
+        "tweaked_group_key":tweaked_pubkey,
     }
 
 

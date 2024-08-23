@@ -145,7 +145,7 @@ def calculate_tweak(pubkey_x: bytes, scripts):
     return tweak_int
 
 
-def taproot_tweak_pubkey(pubkey, h)->tuple[bool, int]:
+def taproot_tweak_pubkey(pubkey, h) -> Point:
     t = int_from_bytes(tagged_hash("TapTweak", pubkey + h))
     if t >= ecurve.q:
         raise ValueError
@@ -153,7 +153,7 @@ def taproot_tweak_pubkey(pubkey, h)->tuple[bool, int]:
     if P is None:
         raise ValueError
     Q = P + ecurve.G*t
-    return has_even_y(Q), bytes_from_int(Q.x)
+    return Q
 
 
 def mod_inverse(number: int, modulus: int) -> int:
